@@ -30,6 +30,7 @@
 #include "bindings.h"
 #include "menu.h"
 #include "zip.h"
+#include "event_log.h"
 #ifndef DISABLE_NUKLEAR
 #include "nuklear_ui/blastem_nuklear.h"
 #endif
@@ -157,8 +158,9 @@ uint32_t load_rom_zip(const char *filename, void **dst)
 						for (offset = 0; offset + SMD_BLOCK_SIZE + SMD_HEADER_SIZE <= out_size; offset += SMD_BLOCK_SIZE)
 						{
 							uint8_t tmp[SMD_BLOCK_SIZE];
-							memcpy(tmp, *dst + offset + SMD_HEADER_SIZE, SMD_BLOCK_SIZE);
-							process_smd_block(*dst + offset, tmp, SMD_BLOCK_SIZE);
+							uint8_t *u8dst = *dst;
+							memcpy(tmp, u8dst + offset + SMD_HEADER_SIZE, SMD_BLOCK_SIZE);
+							process_smd_block((void *)(u8dst + offset), tmp, SMD_BLOCK_SIZE);
 						}
 						out_size = offset;
 					}
@@ -325,7 +327,7 @@ static void on_drag_drop(const char *filename)
 			free(current_system->next_rom);
 		}
 		current_system->next_rom = strdup(filename);
-		current_system->request_exit(current_system);
+		system_request_exit(current_system, 1);
 		if (menu_system && menu_system->type == SYSTEM_GENESIS) {
 			genesis_context *gen = (genesis_context *)menu_system;
 			if (gen->extra) {
@@ -366,7 +368,7 @@ void reload_media(void)
 		num_parts--;
 	}
 	current_system->next_rom = alloc_concat_m(num_parts, start);
-	current_system->request_exit(current_system);
+	system_request_exit(current_system, 1);
 }
 
 void lockon_media(char *lock_on_path)
@@ -430,6 +432,23 @@ void init_system_with_media(const char *path, system_type force_stype)
 	update_title(game_system->info.name);
 }
 
+char *parse_addr_port(char *arg)
+{
+	while (*arg && *arg != ':') {
+		++arg;
+	}
+	if (!*arg) {
+		return NULL;
+	}
+	char *end;
+	int port = strtol(arg + 1, &end, 10);
+	if (port && !*end) {
+		*arg = 0;
+		return arg + 1;
+	}
+	return NULL;
+}
+
 int main(int argc, char ** argv)
 {
 	set_exe_str(argv[0]);
@@ -441,10 +460,13 @@ int main(int argc, char ** argv)
 	system_type stype = SYSTEM_UNKNOWN, force_stype = SYSTEM_UNKNOWN;
 	char * romfname = NULL;
 	char * statefile = NULL;
+	char *reader_addr = NULL, *reader_port = NULL;
+	event_reader reader = {0};
 	debugger_type dtype = DEBUGGER_NATIVE;
 	uint8_t start_in_debugger = 0;
 	uint8_t fullscreen = FULLSCREEN_DEFAULT, use_gl = 1;
 	uint8_t debug_target = 0;
+	char *port;
 	for (int i = 1; i < argc; i++) {
 		if (argv[i][0] == '-') {
 			switch(argv[i][1]) {
@@ -467,6 +489,18 @@ int main(int argc, char ** argv)
 				gdb_remote_init();
 				dtype = DEBUGGER_GDB;
 				start_in_debugger = 1;
+				break;
+			case 'e':
+				i++;
+				if (i >= argc) {
+					fatal_error("-e must be followed by a file name\n");
+				}
+				port = parse_addr_port(argv[i]);
+				if (port) {
+					event_log_tcp(argv[i], port);
+				} else {
+					event_log_file(argv[i]);
+				}
 				break;
 			case 'f':
 				fullscreen = !fullscreen;
@@ -555,18 +589,24 @@ int main(int argc, char ** argv)
 					"	-v          Display version number and exit\n"
 					"	-l          Log 68K code addresses (useful for assemblers)\n"
 					"	-y          Log individual YM-2612 channels to WAVE files\n"
+					"   -e FILE     Write hardware event log to FILE\n"
 				);
 				return 0;
 			default:
 				fatal_error("Unrecognized switch %s\n", argv[i]);
 			}
 		} else if (!loaded) {
-			if (!(cart.size = load_rom(argv[i], &cart.buffer, stype == SYSTEM_UNKNOWN ? &stype : NULL))) {
-				fatal_error("Failed to open %s for reading\n", argv[i]);
+			reader_port = parse_addr_port(argv[i]);
+			if (reader_port) {
+				reader_addr = argv[i];
+			} else {
+				if (!(cart.size = load_rom(argv[i], &cart.buffer, stype == SYSTEM_UNKNOWN ? &stype : NULL))) {
+					fatal_error("Failed to open %s for reading\n", argv[i]);
+				}
+				cart.dir = path_dirname(argv[i]);
+				cart.name = basename_no_extension(argv[i]);
+				cart.extension = path_extension(argv[i]);
 			}
-			cart.dir = path_dirname(argv[i]);
-			cart.name = basename_no_extension(argv[i]);
-			cart.extension = path_extension(argv[i]);
 			romfname = argv[i];
 			loaded = 1;
 		} else if (width < 0) {
@@ -599,6 +639,9 @@ int main(int argc, char ** argv)
 		fullscreen = !fullscreen;
 	}
 	if (!headless) {
+		if (reader_addr) {
+			render_set_external_sync(1);
+		}
 		render_init(width, height, "BlastEm", fullscreen);
 		render_set_drag_drop_handler(on_drag_drop);
 	}
@@ -644,13 +687,14 @@ int main(int argc, char ** argv)
 		warning("%s is not a valid value for the ui.state_format setting. Valid values are gst and native\n", state_format);
 	}
 
-	if (loaded) {
+	if (loaded && !reader_addr) {
 		if (stype == SYSTEM_UNKNOWN) {
 			stype = detect_system_type(&cart);
 		}
 		if (stype == SYSTEM_UNKNOWN) {
 			fatal_error("Failed to detect system type for %s\n", romfname);
 		}
+		
 		current_system = alloc_config_system(stype, &cart, menu ? 0 : opts, force_region);
 		if (!current_system) {
 			fatal_error("Failed to configure emulated machine for %s\n", romfname);
@@ -672,10 +716,24 @@ int main(int argc, char ** argv)
 		menu = 0;
 	}
 #endif
+
+	if (reader_addr) {
+		init_event_reader_tcp(&reader, reader_addr, reader_port);
+		stype = reader_system_type(&reader);
+		if (stype == SYSTEM_UNKNOWN) {
+			fatal_error("Failed to detect system type for %s\n", romfname);
+		}
+		game_system = current_system = alloc_config_player(stype, &reader);
+		//free inflate stream as it was inflateCopied to an internal event reader in the player
+		inflateEnd(&reader.input_stream);
+		setup_saves(&cart, current_system);
+		update_title(current_system->info.name);
+	}
 	
 	current_system->debugger_type = dtype;
 	current_system->enter_debugger = start_in_debugger && menu == debug_target;
 	current_system->start_context(current_system,  menu ? NULL : statefile);
+	render_video_loop();
 	for(;;)
 	{
 		if (current_system->should_exit) {
@@ -691,6 +749,7 @@ int main(int argc, char ** argv)
 			current_system->debugger_type = dtype;
 			current_system->enter_debugger = start_in_debugger && menu == debug_target;
 			current_system->start_context(current_system, statefile);
+			render_video_loop();
 		} else if (menu && game_system) {
 			current_system->arena = set_current_arena(game_system->arena);
 			current_system = game_system;
@@ -708,6 +767,7 @@ int main(int argc, char ** argv)
 			}
 			if (!current_system->next_rom) {
 				current_system->resume_context(current_system);
+				render_video_loop();
 			}
 		} else {
 			break;

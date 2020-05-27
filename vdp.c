@@ -9,6 +9,7 @@
 #include <string.h>
 #include "render.h"
 #include "util.h"
+#include "event_log.h"
 
 #define NTSC_INACTIVE_START 224
 #define PAL_INACTIVE_START 240
@@ -144,7 +145,7 @@ static void update_video_params(vdp_context *context)
 
 static uint8_t color_map_init_done;
 
-vdp_context *init_vdp_context(uint8_t region_pal)
+vdp_context *init_vdp_context(uint8_t region_pal, uint8_t has_max_vsram)
 {
 	vdp_context *context = calloc(1, sizeof(vdp_context) + VRAM_SIZE);
 	if (headless) {
@@ -158,6 +159,7 @@ vdp_context *init_vdp_context(uint8_t region_pal)
 	context->fifo_write = 0;
 	context->fifo_read = -1;
 	context->regs[REG_HINT] = context->hint_counter = 0xFF;
+	context->vsram_size = has_max_vsram ? MAX_VSRAM_SIZE : MIN_VSRAM_SIZE;
 
 	if (!color_map_init_done) {
 		uint8_t b,g,r;
@@ -813,7 +815,7 @@ static void write_cram(vdp_context * context, uint16_t address, uint16_t value)
 	}
 	write_cram_internal(context, addr, value);
 	
-	if (context->hslot >= BG_START_SLOT && (
+	if (context->output && context->hslot >= BG_START_SLOT && (
 		context->vcounter < context->inactive_start + context->border_bot 
 		|| context->vcounter > 0x200 - context->border_top
 	)) {
@@ -907,14 +909,17 @@ static void external_slot(vdp_context * context)
 		{
 		case VRAM_WRITE:
 			if ((context->regs[REG_MODE_2] & (BIT_128K_VRAM|BIT_MODE_5)) == (BIT_128K_VRAM|BIT_MODE_5)) {
+				event_vram_word(context->cycles, start->address, start->value);
 				vdp_check_update_sat(context, start->address, start->value);
 				write_vram_word(context, start->address, start->value);
 			} else {
 				uint8_t byte = start->partial == 1 ? start->value >> 8 : start->value;
-				vdp_check_update_sat_byte(context, start->address ^ 1, byte);
-				write_vram_byte(context, start->address ^ 1, byte);
+				uint32_t address = start->address ^ 1;
+				event_vram_byte(context->cycles, start->address, byte, context->regs[REG_AUTOINC]);
+				vdp_check_update_sat_byte(context, address, byte);
+				write_vram_byte(context, address, byte);
 				if (!start->partial) {
-					start->address = start->address ^ 1;
+					start->address = address;
 					start->partial = 1;
 					//skip auto-increment and removal of entry from fifo
 					return;
@@ -923,22 +928,24 @@ static void external_slot(vdp_context * context)
 			break;
 		case CRAM_WRITE: {
 			//printf("CRAM Write | %X to %X\n", start->value, (start->address/2) & (CRAM_SIZE-1));
+			uint16_t val;
 			if (start->partial == 3) {
-				uint16_t val;
 				if ((start->address & 1) && (context->regs[REG_MODE_2] & BIT_MODE_5)) {
 					val = (context->cram[start->address >> 1 & (CRAM_SIZE-1)] & 0xFF) | start->value << 8;
 				} else {
 					uint16_t address = (context->regs[REG_MODE_2] & BIT_MODE_5) ? start->address >> 1 & (CRAM_SIZE-1) : start->address & 0x1F;
 					val = (context->cram[address] & 0xFF00) | start->value;
 				}
-				write_cram(context, start->address, val);
 			} else {
-				write_cram(context, start->address, start->partial ? context->fifo[context->fifo_write].value : start->value);
+				val = start->partial ? context->fifo[context->fifo_write].value : start->value;
 			}
+			uint8_t buffer[3] = {start->address & 127, val >> 8, val};
+			event_log(EVENT_VDP_INTRAM, context->cycles, sizeof(buffer), buffer);
+			write_cram(context, start->address, val);
 			break;
 		}
 		case VSRAM_WRITE:
-			if (((start->address/2) & 63) < VSRAM_SIZE) {
+			if (((start->address/2) & 63) < context->vsram_size) {
 				//printf("VSRAM Write: %X to %X @ frame: %d, vcounter: %d, hslot: %d, cycle: %d\n", start->value, start->address, context->frame, context->vcounter, context->hslot, context->cycles);
 				if (start->partial == 3) {
 					if (start->address & 1) {
@@ -951,6 +958,8 @@ static void external_slot(vdp_context * context)
 				} else {
 					context->vsram[(start->address/2) & 63] = start->partial ? context->fifo[context->fifo_write].value : start->value;
 				}
+				uint8_t buffer[3] = {((start->address/2) & 63) + 128, context->vsram[(start->address/2) & 63] >> 8, context->vsram[(start->address/2) & 63]};
+				event_log(EVENT_VDP_INTRAM, context->cycles, sizeof(buffer), buffer);
 			}
 
 			break;
@@ -975,7 +984,7 @@ static void external_slot(vdp_context * context)
 			
 			context->flags |= FLAG_READ_FETCHED;
 		}
-	} else if (!(context->cd & 1) && !(context->flags & (FLAG_READ_FETCHED|FLAG_PENDING))) {
+	} else if (!(context->cd & 1) && !(context->flags & FLAG_READ_FETCHED)) {
 		switch(context->cd & 0xF)
 		{
 		case VRAM_READ:
@@ -1012,7 +1021,7 @@ static void external_slot(vdp_context * context)
 			break;
 		case VSRAM_READ: {
 			uint16_t address = (context->address /2) & 63;
-			if (address >= VSRAM_SIZE) {
+			if (address >= context->vsram_size) {
 				address = 0;
 			}
 			context->prefetch = context->vsram[address] & VSRAM_BITS;
@@ -2751,7 +2760,7 @@ static void vdp_h40(vdp_context * context, uint32_t target_cycles)
 	{
 	case 165:
 		//only consider doing a line at a time if the FIFO is empty, there are no pending reads and there is no DMA running
-		if (context->fifo_read == -1 && !(context->flags & FLAG_DMA_RUN) && ((context->cd & 1) || (context->flags & (FLAG_READ_FETCHED|FLAG_PENDING)))) {
+		if (context->fifo_read == -1 && !(context->flags & FLAG_DMA_RUN) && ((context->cd & 1) || (context->flags & FLAG_READ_FETCHED))) {
 			while (target_cycles - context->cycles >= MCLKS_LINE && context->state != PREPARING && context->vcounter != context->inactive_start) {
 				vdp_h40_line(context);
 			}
@@ -3499,6 +3508,8 @@ static void vdp_inactive(vdp_context *context, uint32_t target_cycles, uint8_t i
 			} else if (context->regs[REG_MODE_1] & BIT_MODE_4) {
 				bg_index = 0x10 + (context->regs[REG_BG_COLOR] & 0xF);
 				bg_color = context->colors[MODE4_OFFSET + bg_index];
+			} else {
+				bg_color = render_map_color(0, 0, 0);
 			}
 			if (context->done_composite) {
 				uint8_t pixel = context->compositebuf[dst-context->output];
@@ -3688,6 +3699,19 @@ uint16_t vdp_hv_counter_read(vdp_context * context)
 	return hv;
 }
 
+static void clear_pending(vdp_context *context)
+{
+	context->flags &= ~FLAG_PENDING;
+	context->address = context->address_latch;
+	//It seems like the DMA enable bit doesn't so much enable DMA so much 
+	//as it enables changing CD5 from control port writes
+	if (context->regs[REG_MODE_2] & BIT_DMA_ENABLE) {
+		context->cd = context->cd_latch;
+	} else {
+		context->cd = (context->cd & 0x20) | (context->cd_latch & 0x1F);
+	}
+}
+
 int vdp_control_port_write(vdp_context * context, uint16_t value)
 {
 	//printf("control port write: %X at %d\n", value, context->cycles);
@@ -3695,12 +3719,9 @@ int vdp_control_port_write(vdp_context * context, uint16_t value)
 		return -1;
 	}
 	if (context->flags & FLAG_PENDING) {
-		context->address = (context->address & 0x3FFF) | (value << 14 & 0x1C000);
-		//It seems like the DMA enable bit doesn't so much enable DMA so much 
-		//as it enables changing CD5 from control port writes
-		uint8_t preserve = (context->regs[REG_MODE_2] & BIT_DMA_ENABLE) ? 0x3 : 0x23;
-		context->cd = (context->cd & preserve) | ((value >> 2) & ~preserve & 0xFF);
-		context->flags &= ~FLAG_PENDING;
+		context->address_latch = (context->address_latch & 0x3FFF) | (value << 14 & 0x1C000);
+		context->cd_latch = (context->cd_latch & 0x3) | ((value >> 2) & ~0x3 & 0xFF);
+		clear_pending(context);
 		//Should these be taken care of here or after the first write?
 		context->flags &= ~FLAG_READ_FETCHED;
 		context->flags2 &= ~FLAG2_READ_PENDING;
@@ -3729,8 +3750,10 @@ int vdp_control_port_write(vdp_context * context, uint16_t value)
 		}
 	} else {
 		uint8_t mode_5 = context->regs[REG_MODE_2] & BIT_MODE_5;
-		context->address = (context->address &0xC000) | (value & 0x3FFF);
-		context->cd = (context->cd & 0x3C) | (value >> 14);
+		//contrary to what's in Charles MacDonald's doc, it seems top 2 address bits are cleared
+		//needed for the Mona in 344 Bytes demo
+		context->address_latch = (context->address_latch & 0x1C000) | (value & 0x3FFF);
+		context->cd_latch = (context->cd_latch & 0x3C) | (value >> 14);
 		if ((value & 0xC000) == 0x8000) {
 			//Register write
 			uint8_t reg = (value >> 8) & 0x1F;
@@ -3745,6 +3768,8 @@ int vdp_control_port_write(vdp_context * context, uint16_t value)
 				/*if (reg == REG_MODE_4 && ((value ^ context->regs[reg]) & BIT_H40)) {
 					printf("Mode changed from H%d to H%d @ %d, frame: %d\n", context->regs[reg] & BIT_H40 ? 40 : 32, value & BIT_H40 ? 40 : 32, context->cycles, context->frame);
 				}*/
+				uint8_t buffer[2] = {reg, value};
+				event_log(EVENT_VDP_REG, context->cycles, sizeof(buffer), buffer);
 				context->regs[reg] = value;
 				if (reg == REG_MODE_4) {
 					context->double_res = (value & (BIT_INTERLACE | BIT_DOUBLE_RES)) == (BIT_INTERLACE | BIT_DOUBLE_RES);
@@ -3762,6 +3787,7 @@ int vdp_control_port_write(vdp_context * context, uint16_t value)
 			//context->flags &= ~FLAG_READ_FETCHED;
 			//context->flags2 &= ~FLAG2_READ_PENDING;
 		} else {
+			clear_pending(context);
 			context->flags &= ~FLAG_READ_FETCHED;
 			context->flags2 &= ~FLAG2_READ_PENDING;
 		}
@@ -3792,7 +3818,7 @@ int vdp_data_port_write(vdp_context * context, uint16_t value)
 		return -1;
 	}
 	if (context->flags & FLAG_PENDING) {
-		context->flags &= ~FLAG_PENDING;
+		clear_pending(context);
 		//Should these be cleared here?
 		context->flags &= ~FLAG_READ_FETCHED;
 		context->flags2 &= ~FLAG2_READ_PENDING;
@@ -3827,7 +3853,7 @@ int vdp_data_port_write(vdp_context * context, uint16_t value)
 void vdp_data_port_write_pbc(vdp_context * context, uint8_t value)
 {
 	if (context->flags & FLAG_PENDING) {
-		context->flags &= ~FLAG_PENDING;
+		clear_pending(context);
 		//Should these be cleared here?
 		context->flags &= ~FLAG_READ_FETCHED;
 		context->flags2 &= ~FLAG2_READ_PENDING;
@@ -3866,7 +3892,9 @@ void vdp_test_port_write(vdp_context * context, uint16_t value)
 
 uint16_t vdp_control_port_read(vdp_context * context)
 {
-	context->flags &= ~FLAG_PENDING;
+	if (context->flags & FLAG_PENDING) {
+		clear_pending(context);
+	}
 	context->flags2 &= ~FLAG2_BYTE_PENDING;
 	//Bits 15-10 are not fixed like Charles MacDonald's doc suggests, but instead open bus values that reflect 68K prefetch
 	uint16_t value = context->system->get_open_bus_value(context->system) & 0xFC00;
@@ -3916,7 +3944,7 @@ uint16_t vdp_control_port_read(vdp_context * context)
 uint16_t vdp_data_port_read(vdp_context * context)
 {
 	if (context->flags & FLAG_PENDING) {
-		context->flags &= ~FLAG_PENDING;
+		clear_pending(context);
 		//Should these be cleared here?
 		context->flags &= ~FLAG_READ_FETCHED;
 		context->flags2 &= ~FLAG2_READ_PENDING;
@@ -3933,7 +3961,10 @@ uint16_t vdp_data_port_read(vdp_context * context)
 
 uint8_t vdp_data_port_read_pbc(vdp_context * context)
 {
-	context->flags &= ~(FLAG_PENDING | FLAG_READ_FETCHED);
+	if (context->flags & FLAG_PENDING) {
+		clear_pending(context);
+	}
+	context->flags &= ~FLAG_READ_FETCHED;
 	context->flags2 &= ~FLAG2_BYTE_PENDING;
 		
 	context->cd = VRAM_READ8;
@@ -4232,14 +4263,14 @@ void vdp_int_ack(vdp_context * context)
 	}
 }
 
-#define VDP_STATE_VERSION 1
+#define VDP_STATE_VERSION 3
 void vdp_serialize(vdp_context *context, serialize_buffer *buf)
 {
 	save_int8(buf, VDP_STATE_VERSION);
 	save_int8(buf, VRAM_SIZE / 1024);//VRAM size in KB, needed for future proofing
 	save_buffer8(buf, context->vdpmem, VRAM_SIZE);
 	save_buffer16(buf, context->cram, CRAM_SIZE);
-	save_buffer16(buf, context->vsram, VSRAM_SIZE);
+	save_buffer16(buf, context->vsram, MAX_VSRAM_SIZE);
 	save_buffer8(buf, context->sat_cache, SAT_CACHE_SIZE);
 	for (int i = 0; i <= REG_DMASRC_H; i++)
 	{
@@ -4312,6 +4343,8 @@ void vdp_serialize(vdp_context *context, serialize_buffer *buf)
 	save_int32(buf, context->cycles);
 	save_int32(buf, context->pending_vint_start);
 	save_int32(buf, context->pending_hint_start);
+	save_int32(buf, context->address_latch);
+	save_int8(buf, context->cd_latch);
 }
 
 void vdp_deserialize(deserialize_buffer *buf, void *vcontext)
@@ -4337,7 +4370,7 @@ void vdp_deserialize(deserialize_buffer *buf, void *vcontext)
 	{
 		update_color_map(context, i, context->cram[i]);
 	}
-	load_buffer16(buf, context->vsram, VSRAM_SIZE);
+	load_buffer16(buf, context->vsram, version > 1 ? MAX_VSRAM_SIZE : MIN_VSRAM_SIZE);
 	load_buffer8(buf, context->sat_cache, SAT_CACHE_SIZE);
 	for (int i = 0; i <= REG_DMASRC_H; i++)
 	{
@@ -4446,6 +4479,13 @@ void vdp_deserialize(deserialize_buffer *buf, void *vcontext)
 	context->cycles = load_int32(buf);
 	context->pending_vint_start = load_int32(buf);
 	context->pending_hint_start = load_int32(buf);
+	if (version > 2) {
+		context->address_latch = load_int32(buf);
+		context->cd_latch = load_int8(buf);
+	} else {
+		context->address_latch = context->address;
+		context->cd_latch = context->cd;
+	}
 	update_video_params(context);
 }
 
@@ -4520,5 +4560,87 @@ void vdp_inc_debug_mode(vdp_context *context)
 			context->debug_modes[i]++;
 			return;
 		}
+	}
+}
+
+void vdp_replay_event(vdp_context *context, uint8_t event, event_reader *reader)
+{
+	uint32_t address;
+	deserialize_buffer *buffer = &reader->buffer;
+	switch (event)
+	{
+	case EVENT_VRAM_BYTE:
+		reader_ensure_data(reader, 3);
+		address = load_int16(buffer);
+		break;
+	case EVENT_VRAM_BYTE_DELTA:
+		reader_ensure_data(reader, 2);
+		address = reader->last_byte_address + load_int8(buffer);
+		break;
+	case EVENT_VRAM_BYTE_ONE:
+		reader_ensure_data(reader, 1);
+		address = reader->last_byte_address + 1;
+		break;
+	case EVENT_VRAM_BYTE_AUTO:
+		reader_ensure_data(reader, 1);
+		address = reader->last_byte_address + context->regs[REG_AUTOINC];
+		break;
+	case EVENT_VRAM_WORD:
+		reader_ensure_data(reader, 4);
+		address = load_int8(buffer) << 16;
+		address |= load_int16(buffer);
+		break;
+	case EVENT_VRAM_WORD_DELTA:
+		reader_ensure_data(reader, 3);
+		address = reader->last_word_address + load_int8(buffer);
+		break;
+	case EVENT_VDP_REG:
+	case EVENT_VDP_INTRAM:
+		reader_ensure_data(reader, event == EVENT_VDP_REG ? 2 : 3);
+		address = load_int8(buffer);
+		break;
+	}
+	
+	switch (event)
+	{
+	case EVENT_VDP_REG: {
+		uint8_t value = load_int8(buffer);
+		context->regs[address] = value;
+		if (address == REG_MODE_4) {
+			context->double_res = (value & (BIT_INTERLACE | BIT_DOUBLE_RES)) == (BIT_INTERLACE | BIT_DOUBLE_RES);
+			if (!context->double_res) {
+				context->flags2 &= ~FLAG2_EVEN_FIELD;
+			}
+		}
+		if (address == REG_MODE_1 || address == REG_MODE_2 || address == REG_MODE_4) {
+			update_video_params(context);
+		}
+		break;
+	}
+	case EVENT_VRAM_BYTE:
+	case EVENT_VRAM_BYTE_DELTA:
+	case EVENT_VRAM_BYTE_ONE:
+	case EVENT_VRAM_BYTE_AUTO: {
+		uint8_t byte = load_int8(buffer);
+		reader->last_byte_address = address;
+		vdp_check_update_sat_byte(context, address ^ 1, byte);
+		write_vram_byte(context, address ^ 1, byte);
+		break;
+	}
+	case EVENT_VRAM_WORD:
+	case EVENT_VRAM_WORD_DELTA: {
+		uint16_t value = load_int16(buffer);
+		reader->last_word_address = address;
+		vdp_check_update_sat(context, address, value);
+		write_vram_word(context, address, value);
+		break;
+	}
+	case EVENT_VDP_INTRAM:
+		if (address < 128) {
+			write_cram(context, address, load_int16(buffer));
+		} else {
+			context->vsram[address&63] = load_int16(buffer);
+		}
+		break;
 	}
 }

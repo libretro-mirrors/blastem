@@ -428,22 +428,23 @@ static void run_sms(system_header *system)
 			target_cycle -= adjust;
 		}
 	}
-#ifndef IS_LIB
-	bindings_release_capture();
-	vdp_release_framebuffer(sms->vdp);
-	render_pause_source(sms->psg->audio);
-#endif
+	if (sms->header.force_release || render_should_release_on_exit()) {
+		bindings_release_capture();
+		vdp_release_framebuffer(sms->vdp);
+		render_pause_source(sms->psg->audio);
+	}
 	sms->should_return = 0;
 }
 
 static void resume_sms(system_header *system)
 {
 	sms_context *sms = (sms_context *)system;
-#ifndef IS_LIB
-	bindings_reacquire_capture();
-	vdp_reacquire_framebuffer(sms->vdp);
-	render_resume_source(sms->psg->audio);
-#endif
+	if (sms->header.force_release || render_should_release_on_exit()) {
+		sms->header.force_release = 0;
+		bindings_reacquire_capture();
+		vdp_reacquire_framebuffer(sms->vdp);
+		render_resume_source(sms->psg->audio);
+	}
 	run_sms(system);
 }
 
@@ -629,7 +630,7 @@ sms_context *alloc_configure_sms(system_media *media, uint32_t opts, uint8_t for
 	
 	set_gain_config(sms);
 	
-	sms->vdp = init_vdp_context(0);
+	sms->vdp = init_vdp_context(0, 0);
 	sms->vdp->system = &sms->header;
 	
 	sms->header.info.save_type = SAVE_NONE;

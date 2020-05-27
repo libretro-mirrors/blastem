@@ -9,8 +9,10 @@ typedef struct system_media system_media;
 typedef enum {
 	SYSTEM_UNKNOWN,
 	SYSTEM_GENESIS,
+	SYSTEM_GENESIS_PLAYER,
 	SYSTEM_SMS,
-	SYSTEM_JAGUAR
+	SYSTEM_SMS_PLAYER,
+	SYSTEM_JAGUAR,
 } system_type;
 
 typedef enum {
@@ -33,6 +35,7 @@ typedef void (*system_ptr8_sizet_fun)(system_header *, uint8_t *, size_t);
 
 #include "arena.h"
 #include "romdb.h"
+#include "event_log.h"
 
 struct system_header {
 	system_header           *next_context;
@@ -58,6 +61,8 @@ struct system_header {
 	system_fun              config_updated;
 	system_ptrszt_fun_rptr8 serialize;
 	system_ptr8_sizet_fun   deserialize;
+	system_str_fun          start_vgm_log;
+	system_fun              stop_vgm_log;
 	rom_info                info;
 	arena                   *arena;
 	char                    *next_rom;
@@ -67,6 +72,8 @@ struct system_header {
 	uint8_t                 save_state;
 	uint8_t                 delayed_load_slot;
 	uint8_t                 has_keyboard;
+	uint8_t                 vgm_logging;
+	uint8_t                 force_release;
 	debugger_type           debugger_type;
 	system_type             type;
 };
@@ -84,5 +91,7 @@ struct system_media {
 
 system_type detect_system_type(system_media *media);
 system_header *alloc_config_system(system_type stype, system_media *media, uint32_t opts, uint8_t force_region);
+system_header *alloc_config_player(system_type stype, event_reader *reader);
+void system_request_exit(system_header *system, uint8_t force_release);
 
 #endif //SYSTEM_H_

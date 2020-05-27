@@ -2327,7 +2327,7 @@ void translate_z80inst(z80inst * inst, z80_context * context, uint16_t address, 
 		if (inst->addr_mode == Z80_IMMED_INDIRECT) {
 			mov_ir(code, inst->immed, opts->gen.scratch1, SZ_B);
 		} else {
-			zreg_to_native(opts, Z80_C, opts->gen.scratch2);
+			zreg_to_native(opts, Z80_C, opts->gen.scratch1);
 		}
 		call(code, opts->read_io);
 		if (inst->addr_mode != Z80_IMMED_INDIRECT) {
@@ -3412,6 +3412,9 @@ void init_z80_opts(z80_options * options, memmap_chunk const * chunks, uint32_t 
 	neg_r(code, options->gen.cycles, SZ_D);
 	add_rdispr(code, options->gen.context_reg, offsetof(z80_context, target_cycle), options->gen.cycles, SZ_D);
 	cmp_rdispr(code, options->gen.context_reg, offsetof(z80_context, int_cycle), options->gen.cycles, SZ_D);
+	jcc(code, CC_B, skip_int);
+	//check that we are not past the end of interrupt pulse
+	cmp_rrdisp(code, options->gen.cycles, options->gen.context_reg, offsetof(z80_context, int_pulse_end), SZ_D);
 	jcc(code, CC_B, skip_int);
 	//set limit to the cycle limit
 	mov_rdispr(code, options->gen.context_reg, offsetof(z80_context, sync_cycle), options->gen.scratch2, SZ_D);

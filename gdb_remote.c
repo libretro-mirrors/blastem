@@ -18,13 +18,13 @@ int gdb_sock;
 #define GDB_OUT_FD STDOUT_FILENO
 #define GDB_READ read
 #define GDB_WRITE write
+#include <unistd.h>
 #endif
 
 #include "gdb_remote.h"
 #include "68kinst.h"
 #include "debug.h"
 #include "util.h"
-#include <unistd.h>
 #include <fcntl.h>
 #include <stddef.h>
 #include <stdlib.h>
@@ -132,22 +132,10 @@ void update_status(m68k_context * context, uint16_t value)
 	}
 }
 
-uint8_t m68k_read_byte(m68k_context * context, uint32_t address)
+static uint8_t m68k_read_byte(m68k_context *context, uint32_t address)
 {
-	
-	genesis_context *gen = context->system;
-	//TODO: Use generated read/write functions to support access to hardware that is not ROM or RAM
-	uint16_t * word = get_native_pointer(address & 0xFFFFFFFE, (void **)context->mem_pointers, &context->options->gen);
-	if (word) {	
-	if (address & 1) {
-		return *word;
-	}
-	return *word >> 8;
-}
-	if (address >= 0xA00000 && address < 0xA04000) {
-		return gen->zram[address & 0x1FFF];
-	}
-	return 0;
+	//TODO: share this implementation with builtin debugger
+	return read_byte(address, (void **)context->mem_pointers, &context->options->gen, context);
 }
 
 void m68k_write_byte(m68k_context * context, uint32_t address, uint8_t value)
@@ -401,6 +389,10 @@ void gdb_run_command(m68k_context * context, uint32_t pc, char * command)
 			gdb_send_command("m1");
 		} else if (!strcmp("sThreadInfo", command + 1)) {
 			gdb_send_command("l");
+		} else if (!memcmp("ThreadExtraInfo", command+1, strlen("ThreadExtraInfo"))) {
+			gdb_send_command("");
+		} else if (command[1] == 'P') {
+			gdb_send_command("");
 		} else {
 			goto not_impl;
 		}
@@ -558,21 +550,13 @@ void  gdb_debug_enter(m68k_context * context, uint32_t pc)
 	}
 }
 
-#ifdef _WIN32
-void gdb_cleanup(void)
-{
-	WSACleanup();
-}
-WSADATA wsa_data;
-#endif
-
 void gdb_remote_init(void)
 {
 	buf = malloc(INITIAL_BUFFER_SIZE);
 	curbuf = NULL;
 	bufsize = INITIAL_BUFFER_SIZE;
 #ifdef _WIN32
-	WSAStartup(MAKEWORD(2,2), &wsa_data);
+	socket_init();
 
 	struct addrinfo request, *result;
 	memset(&request, 0, sizeof(request));
@@ -588,6 +572,7 @@ void gdb_remote_init(void)
 	if (bind(listen_sock, result->ai_addr, result->ai_addrlen) < 0) {
 		fatal_error("Failed to bind GDB remote debugging socket");
 	}
+	freeaddrinfo(result);
 	if (listen(listen_sock, 1) < 0) {
 		fatal_error("Failed to listen on GDB remote debugging socket");
 	}
@@ -595,7 +580,7 @@ void gdb_remote_init(void)
 	if (gdb_sock < 0) {
 		fatal_error("accept returned an error while listening on GDB remote debugging socket");
 	}
-	closesocket(listen_sock);
+	socket_close(listen_sock);
 #else
 	disable_stdout_messages();
 #endif

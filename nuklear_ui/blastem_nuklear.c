@@ -441,11 +441,11 @@ void view_key_bindings(struct nk_context *context)
 	};
 	const char *general_binds[] = {
 		"ui.exit", "ui.save_state", "ui.toggle_fullscreen", "ui.soft_reset", "ui.reload",
-		"ui.screenshot", "ui.sms_pause", "ui.toggle_keyboard_cpatured", "ui.release_mouse"
+		"ui.screenshot", "ui.vgm_log", "ui.sms_pause", "ui.toggle_keyboard_cpatured", "ui.release_mouse"
 	};
 	const char *general_names[] = {
 		"Show Menu", "Quick Save", "Toggle Fullscreen", "Soft Reset", "Reload Media",
-		"Internal Screenshot", "SMS Pause", "Capture Keyboard", "Release Mouse"
+		"Internal Screenshot", "Toggle VGM Log", "SMS Pause", "Capture Keyboard", "Release Mouse"
 	};
 	const char *speed_binds[] = {
 		"ui.next_speed", "ui.prev_speed",
@@ -592,6 +592,7 @@ const char *translate_binding_option(const char *option)
 		conf_names = tern_insert_ptr(conf_names, "ui.vdp_debug_pal", "VDP Debug Palette");
 		conf_names = tern_insert_ptr(conf_names, "ui.enter_debugger", "Enter CPU Debugger");
 		conf_names = tern_insert_ptr(conf_names, "ui.screenshot", "Take Screenshot");
+		conf_names = tern_insert_ptr(conf_names, "ui.vgm_log", "Toggle VGM Log");
 		conf_names = tern_insert_ptr(conf_names, "ui.exit", "Show Menu");
 		conf_names = tern_insert_ptr(conf_names, "ui.save_state", "Quick Save");
 		conf_names = tern_insert_ptr(conf_names, "ui.set_speed.0", "Set Speed 0");
@@ -2219,7 +2220,7 @@ void show_pause_menu(void)
 		context->style.window.fixed_background = nk_style_item_color(nk_rgba(0, 0, 0, 128));
 		current_view = view_pause;
 		context->input.selected_widget = 0;
-		current_system->request_exit(current_system);
+		system_request_exit(current_system, 1);
 	} else if (current_system && !set_binding) {
 		clear_view_stack();
 		show_play_view();

@@ -51,8 +51,12 @@ struct genesis_context {
 	uint32_t        int_latency_prev1;
 	uint32_t        int_latency_prev2;
 	uint32_t        reset_cycle;
+	uint32_t        last_frame;
+	uint32_t        last_flush_cycle;
+	uint32_t        soft_flush_cycles;
 	uint8_t         bank_regs[8];
 	uint16_t        z80_bank_reg;
+	uint16_t        tmss_lock[2];
 	uint16_t        mapper_start_index;
 	uint8_t         mapper_type;
 	uint8_t         save_type;
@@ -60,6 +64,7 @@ struct genesis_context {
 	uint8_t         version_reg;
 	uint8_t         bus_busy;
 	uint8_t         reset_requested;
+	uint8_t         tmss;
 	eeprom_state    eeprom;
 	nor_state       nor;
 };
@@ -69,7 +74,7 @@ struct genesis_context {
 
 m68k_context * sync_components(m68k_context *context, uint32_t address);
 genesis_context *alloc_config_genesis(void *rom, uint32_t rom_size, void *lock_on, uint32_t lock_on_size, uint32_t system_opts, uint8_t force_region);
-void genesis_serialize(genesis_context *gen, serialize_buffer *buf, uint32_t m68k_pc);
+void genesis_serialize(genesis_context *gen, serialize_buffer *buf, uint32_t m68k_pc, uint8_t all);
 void genesis_deserialize(deserialize_buffer *buf, genesis_context *gen);
 
 #endif //GENESIS_H_

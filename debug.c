@@ -95,6 +95,12 @@ void strip_nl(char * buf)
 	}
 }
 
+static uint8_t m68k_read_byte(uint32_t address, m68k_context *context)
+{
+	//TODO: share this implementation with GDB debugger
+	return read_byte(address, (void **)context->mem_pointers, &context->options->gen, context);
+}
+
 uint16_t m68k_read_word(uint32_t address, m68k_context *context)
 {
 	return read_word(address, (void **)context->mem_pointers, &context->options->gen, context);
@@ -105,7 +111,7 @@ uint32_t m68k_read_long(uint32_t address, m68k_context *context)
 	return m68k_read_word(address, context) << 16 | m68k_read_word(address + 2, context);
 }
 
-void debugger_print(m68k_context *context, char format_char, char *param)
+void debugger_print(m68k_context *context, char format_char, char *param, uint32_t address)
 {
 	uint32_t value;
 	char format[8];
@@ -141,7 +147,7 @@ void debugger_print(m68k_context *context, char format_char, char *param)
 				value &= 0xFF;
 			}
 		}
-	} else if (param[0] == 'S' && param[1] == 'R') {
+	} else if (param[0] == 's' && param[1] == 'r') {
 		value = (context->status << 8);
 		for (int flag = 0; flag < 5; flag++) {
 			value |= context->flags[flag] << (4-flag);
@@ -151,11 +157,15 @@ void debugger_print(m68k_context *context, char format_char, char *param)
 	} else if(param[0] == 'f') {
 		genesis_context *gen = context->system;
 		value = gen->vdp->frame;
+	} else if (param[0] == 'p' && param[1] == 'c') {
+		value = address;
 	} else if ((param[0] == '0' && param[1] == 'x') || param[0] == '$') {
 		char *after;
 		uint32_t p_addr = strtol(param+(param[0] == '0' ? 2 : 1), &after, 16);
 		if (after[0] == '.' && after[1] == 'l') {
 			value = m68k_read_long(p_addr, context);
+		} else if (after[0] == '.' && after[1] == 'b') {
+			value = m68k_read_byte(p_addr, context);
 		} else {
 			value = m68k_read_word(p_addr, context);
 		}
@@ -164,6 +174,8 @@ void debugger_print(m68k_context *context, char format_char, char *param)
 		uint32_t p_addr = param[1] == 'a' ? context->aregs[reg] : context->dregs[reg];
 		if (param[4] == '.' && param[5] == 'l') {
 			value = m68k_read_long(p_addr, context);
+		} else if (param[4] == '.' && param[5] == 'b') {
+			value = m68k_read_byte(p_addr, context);
 		} else {
 			value = m68k_read_word(p_addr, context);
 		}
@@ -348,22 +360,7 @@ void zdebugger_print(z80_context * context, char format_char, char * param)
 	case '0':
 		if (param[1] == 'x') {
 			uint16_t p_addr = strtol(param+2, NULL, 16);
-			if (p_addr < 0x4000) {
-				value = system->zram[p_addr & 0x1FFF];
-			} else if(p_addr >= 0x8000) {
-				uint32_t v_addr = system->z80_bank_reg << 15;
-				v_addr += p_addr & 0x7FFF;
-				if (v_addr < 0x400000) {
-					value = system->cart[v_addr/2];
-				} else if(v_addr > 0xE00000) {
-					value = system->work_ram[(v_addr & 0xFFFF)/2];
-				}
-				if (v_addr & 1) {
-					value &= 0xFF;
-				} else {
-					value >>= 8;
-				}
-			}
+			value = read_byte(p_addr, (void **)context->mem_pointers, &context->options->gen, context);
 		}
 		break;
 	}
@@ -567,12 +564,15 @@ z80_context * zdebugger(z80_context * context, uint16_t address)
 				}
 				break;
 			}
+			case '?':
+				print_z80_help();
+				break;
 			default:
 				if (
 					!context->Z80_OPTS->gen.debug_cmd_handler
 					|| !context->Z80_OPTS->gen.debug_cmd_handler(&system->header, input_buf)
 				) {
-					fprintf(stderr, "Unrecognized debugger command %s\n", input_buf);
+					fprintf(stderr, "Unrecognized debugger command %s\nUse '?' for help.\n", input_buf);
 				}
 				break;
 		}
@@ -585,7 +585,7 @@ z80_context * zdebugger(z80_context * context, uint16_t address)
 static uint32_t branch_t;
 static uint32_t branch_f;
 
-int run_debugger_command(m68k_context *context, char *input_buf, m68kinst inst, uint32_t after)
+int run_debugger_command(m68k_context *context, uint32_t address, char *input_buf, m68kinst inst, uint32_t after)
 {
 	char * param;
 	char format_char;
@@ -703,7 +703,7 @@ int run_debugger_command(m68k_context *context, char *input_buf, m68kinst inst, 
 					fputs("display command requires a parameter\n", stderr);
 					break;
 				}
-				debugger_print(context, format_char, param);
+				debugger_print(context, format_char, param, address);
 				add_display(&displays, &disp_index, format_char, param);
 			} else {
 				param = find_param(input_buf);
@@ -734,11 +734,13 @@ int run_debugger_command(m68k_context *context, char *input_buf, m68kinst inst, 
 				}
 			}
 			param = find_param(input_buf);
-			if (!param) {
-				fputs("p command requires a parameter\n", stderr);
-				break;
+			if (param) {
+				debugger_print(context, format_char, param, address);
+			} else {
+				m68k_disasm(&inst, input_buf);
+				printf("%X: %s\n", address, input_buf);
 			}
-			debugger_print(context, format_char, param);
+			
 			break;
 		case 'n':
 			if (inst.op == M68K_RTS) {
@@ -802,10 +804,12 @@ int run_debugger_command(m68k_context *context, char *input_buf, m68kinst inst, 
 				param = find_param(input_buf);
 				if (!param) {
 					fputs("Missing destination parameter for set\n", stderr);
+					return 1;
 				}
 				char *val = find_param(param);
 				if (!val) {
 					fputs("Missing value parameter for set\n", stderr);
+					return 1;
 				}
 				long int_val;
 				int reg_num;
@@ -846,6 +850,9 @@ int run_debugger_command(m68k_context *context, char *input_buf, m68kinst inst, 
 					fprintf(stderr, "Invalid destinatino %s\n", param);
 				}
 				break;
+			} else if (input_buf[1] == 'r') {
+				system->header.soft_reset(&system->header);
+				return 0;
 			} else {
 				if (inst.op == M68K_RTS) {
 					after = m68k_read_long(context->aregs[7], context);
@@ -940,17 +947,62 @@ int run_debugger_command(m68k_context *context, char *input_buf, m68kinst inst, 
 			break;
 		}
 #endif
+		case '?':
+			print_m68k_help();
+			break;
 		case 'q':
 			puts("Quitting");
 			exit(0);
 			break;
 		default:
-			fprintf(stderr, "Unrecognized debugger command %s\n", input_buf);
+			fprintf(stderr, "Unrecognized debugger command %s\nUse '?' for help.\n", input_buf);
 			break;
 	}
 	return 1;
 }
 
+void print_m68k_help()
+{
+	printf("M68k Debugger Commands\n");
+	printf("    b ADDRESS            - Set a breakpoint at ADDRESS\n");
+	printf("    d BREAKPOINT         - Delete a 68K breakpoint\n");
+	printf("    co BREAKPOINT        - Run a list of debugger commands each time\n");
+	printf("                           BREAKPOINT is hit\n");
+	printf("    a ADDRESS            - Advance to address\n");
+	printf("    n                    - Advance to next instruction\n");
+	printf("    o                    - Advance to next instruction ignoring branches to\n");
+	printf("                           lower addresses (good for breaking out of loops)\n");
+	printf("    s                    - Advance to next instruction (follows bsr/jsr)\n");
+	printf("    se REG|ADDRESS VALUE - Set value\n");
+	printf("    sr                   - Soft reset\n");
+	printf("    c                    - Continue\n");
+	printf("    bt                   - Print a backtrace\n");
+	printf("    p[/(x|X|d|c)] VALUE  - Print a register or memory location\n");
+	printf("    di[/(x|X|d|c)] VALUE - Print a register or memory location each time\n");
+	printf("                           a breakpoint is hit\n");
+	printf("    vs                   - Print VDP sprite list\n");
+	printf("    vr                   - Print VDP register info\n");
+	printf("    yc [CHANNEL NUM]     - Print YM-2612 channel info\n");
+	printf("    yt                   - Print YM-2612 timer info\n");
+	printf("    zb ADDRESS           - Set a Z80 breakpoint\n");
+	printf("    zp[/(x|X|d|c)] VALUE - Display a Z80 value\n");
+	printf("    ?                    - Display help\n");
+	printf("    q                    - Quit BlastEm\n");
+}
+
+void print_z80_help()
+{
+	printf("Z80 Debugger Commands\n");
+	printf("    b  ADDRESS           - Set a breakpoint at ADDRESS\n");
+	printf("    de BREAKPOINT        - Delete a Z80 breakpoint\n");
+	printf("    a  ADDRESS           - Advance to address\n");
+	printf("    n                    - Advance to next instruction\n");
+	printf("    c                    - Continue\n");
+	printf("    p[/(x|X|d|c)] VALUE  - Print a register or memory location\n");
+	printf("    di[/(x|X|d|c)] VALUE - Print a register or memory location each time\n");
+	printf("                           a breakpoint is hit\n");
+	printf("    q                    - Quit BlastEm\n");
+}
 
 void debugger(m68k_context * context, uint32_t address)
 {
@@ -1000,7 +1052,7 @@ void debugger(m68k_context * context, uint32_t address)
 				char *cmd = commands;
 				strip_nl(cmd);
 				commands += strlen(cmd) + 1;
-				debugging = run_debugger_command(context, cmd, inst, after);
+				debugging = run_debugger_command(context, address, cmd, inst, after);
 			}
 			free(copy);
 		}
@@ -1013,7 +1065,7 @@ void debugger(m68k_context * context, uint32_t address)
 		remove_breakpoint(context, address);
 	}
 	for (disp_def * cur = displays; cur; cur = cur->next) {
-		debugger_print(context, cur->format_char, cur->param);
+		debugger_print(context, cur->format_char, cur->param, address);
 	}
 	m68k_disasm(&inst, input_buf);
 	printf("%X: %s\n", address, input_buf);
@@ -1053,7 +1105,7 @@ void debugger(m68k_context * context, uint32_t address)
 		} else {
 			strcpy(input_buf, last_cmd);
 		}
-		debugging = run_debugger_command(context, input_buf, inst, after);
+		debugging = run_debugger_command(context, address, input_buf, inst, after);
 	}
 	return;
 }

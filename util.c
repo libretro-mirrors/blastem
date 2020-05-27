@@ -7,7 +7,6 @@
 
 #include <sys/types.h>
 #include <sys/stat.h>
-#include <unistd.h>
 #include <errno.h>
 
 #ifdef __ANDROID__
@@ -442,6 +441,10 @@ void fatal_error(char *format, ...)
 	exit(1);
 }
 
+#ifndef _WIN32
+#include <unistd.h>
+#endif
+
 void warning(char *format, ...)
 {
 	va_list args;
@@ -532,6 +535,8 @@ void disable_stdout_messages(void)
 }
 
 #ifdef _WIN32
+#define WINVER 0x501
+#include <winsock2.h>
 #include <windows.h>
 #include <shlobj.h>
 
@@ -679,7 +684,80 @@ int ensure_dir_exists(const char *path)
 	return CreateDirectory(path, NULL);
 }
 
+static WSADATA wsa_data;
+static void socket_cleanup(void)
+{
+	WSACleanup();
+}
+
+void socket_init(void)
+{
+	static uint8_t started;
+	if (!started) {
+		started = 1;
+		WSAStartup(MAKEWORD(2,2), &wsa_data);
+		atexit(socket_cleanup);
+	}
+}
+
+int socket_blocking(int sock, int should_block)
+{
+	u_long param = !should_block;
+	if (ioctlsocket(sock, FIONBIO, &param)) {
+		return WSAGetLastError();
+	}
+	return 0;
+}
+
+void socket_close(int sock)
+{
+	closesocket(sock);
+}
+
+int socket_last_error(void)
+{
+	return WSAGetLastError();
+}
+
+int socket_error_is_wouldblock(void)
+{
+	return WSAGetLastError() == WSAEWOULDBLOCK;
+}
+
 #else
+#include <fcntl.h>
+#include <signal.h>
+
+void socket_init(void)
+{
+	//SIGPIPE on network sockets is not desired
+	//would be better to do this in a more limited way,
+	//but the alternatives are not portable
+	signal(SIGPIPE, SIG_IGN);
+}
+
+int socket_blocking(int sock, int should_block)
+{
+	if (fcntl(sock, F_SETFL, should_block ? 0 : O_NONBLOCK)) {
+		return errno;
+	}
+	return 0;
+}
+
+void socket_close(int sock)
+{
+	close(sock);
+}
+
+int socket_last_error(void)
+{
+	return errno;
+}
+
+int socket_error_is_wouldblock(void)
+{
+	return errno == EAGAIN || errno == EWOULDBLOCK;
+}
 
 char * get_home_dir()
 {

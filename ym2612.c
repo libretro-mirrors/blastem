@@ -11,6 +11,7 @@
 #include "render.h"
 #include "wave.h"
 #include "blastem.h"
+#include "event_log.h"
 
 //#define DO_DEBUG_PRINT
 #ifdef DO_DEBUG_PRINT
@@ -21,9 +22,7 @@
 #define dfopen(var, fname, mode)
 #endif
 
-#define BUSY_CYCLES_ADDRESS 17
-#define BUSY_CYCLES_DATA_LOW 83
-#define BUSY_CYCLES_DATA_HIGH 47
+#define BUSY_CYCLES 32
 #define OP_UPDATE_PERIOD 144
 
 #define BIT_TIMERA_ENABLE 0x1
@@ -122,6 +121,27 @@ void ym_adjust_master_clock(ym2612_context * context, uint32_t master_clock)
 	render_audio_adjust_clock(context->audio, master_clock, context->clock_inc * NUM_OPERATORS);
 }
 
+void ym_adjust_cycles(ym2612_context *context, uint32_t deduction)
+{
+	context->current_cycle -= deduction;
+	if (context->write_cycle != CYCLE_NEVER && context->write_cycle >= deduction) {
+		context->write_cycle -= deduction;
+	} else {
+		context->write_cycle = CYCLE_NEVER;
+	}
+	if (context->busy_start != CYCLE_NEVER && context->busy_start >= deduction) {
+		context->busy_start -= deduction;
+	} else {
+		context->busy_start = CYCLE_NEVER;
+	}
+	if (context->last_status_cycle != CYCLE_NEVER && context->last_status_cycle >= deduction) {
+		context->last_status_cycle -= deduction;
+	} else {
+		context->last_status = 0;
+		context->last_status_cycle = CYCLE_NEVER;
+	}
+}
+
 #ifdef __ANDROID__
 #define log2(x) (log(x)/log(2))
 #endif
@@ -173,7 +193,11 @@ void ym_init(ym2612_context * context, uint32_t master_clock, uint32_t clock_div
 	dfopen(debug_file, "ym_debug.txt", "w");
 	memset(context, 0, sizeof(*context));
 	context->clock_inc = clock_div * 6;
+	context->busy_cycles = BUSY_CYCLES * context->clock_inc;
 	context->audio = render_audio_source(master_clock, context->clock_inc * NUM_OPERATORS, 2);
+	//TODO: pick a randomish high initial value and lower it over time
+	context->invalid_status_decay = 225000 * context->clock_inc;
+	context->status_address_mask = (options & YM_OPT_3834) ? 0 : 3;
 	
 	//some games seem to expect that the LR flags start out as 1
 	for (int i = 0; i < NUM_CHANNELS; i++) {
@@ -635,10 +659,6 @@ void ym_run(ym2612_context * context, uint32_t to_cycle)
 		}
 		
 	}
-	if (context->current_cycle >= context->write_cycle + (context->busy_cycles * context->clock_inc / 6)) {
-		context->status &= 0x7F;
-		context->write_cycle = CYCLE_NEVER;
-	}
 	//printf("Done running YM2612 at cycle %d\n", context->current_cycle, to_cycle);
 }
 
@@ -647,9 +667,6 @@ void ym_address_write_part1(ym2612_context * context, uint8_t address)
 	//printf("address_write_part1: %X\n", address);
 	context->selected_reg = address;
 	context->selected_part = 0;
-	context->write_cycle = context->current_cycle;
-	context->busy_cycles = BUSY_CYCLES_ADDRESS;
-	context->status |= 0x80;
 }
 
 void ym_address_write_part2(ym2612_context * context, uint8_t address)
@@ -657,9 +674,6 @@ void ym_address_write_part2(ym2612_context * context, uint8_t address)
 	//printf("address_write_part2: %X\n", address);
 	context->selected_reg = address;
 	context->selected_part = 1;
-	context->write_cycle = context->current_cycle;
-	context->busy_cycles = BUSY_CYCLES_ADDRESS;
-	context->status |= 0x80;
 }
 
 static uint8_t fnum_to_keycode[] = {
@@ -766,8 +780,32 @@ static uint32_t ym_calc_phase_inc(ym2612_context * context, ym_operator * operat
 	return inc;
 }
 
+void ym_vgm_log(ym2612_context *context, uint32_t master_clock, vgm_writer *vgm)
+{
+	vgm_ym2612_init(vgm, 6 * master_clock / context->clock_inc);
+	context->vgm = vgm;
+	for (uint8_t reg = YM_PART1_START; reg < YM_REG_END; reg++) {
+		if ((reg >= REG_DETUNE_MULT && (reg & 3) == 3) || (reg >= 0x2D && reg < REG_DETUNE_MULT) || reg == 0x23 || reg == 0x29) {
+			//skip invalid registers
+			continue;
+		}
+		vgm_ym2612_part1_write(context->vgm, context->current_cycle, reg, context->part1_regs[reg - YM_PART1_START]);
+	}
+	
+	for (uint8_t reg = YM_PART2_START; reg < YM_REG_END; reg++) {
+		if ((reg & 3) == 3 || (reg >= REG_FNUM_LOW_CH3 && reg < REG_ALG_FEEDBACK)) {
+			//skip invalid registers
+			continue;
+		}
+		vgm_ym2612_part2_write(context->vgm, context->current_cycle, reg, context->part2_regs[reg - YM_PART2_START]);
+	}
+}
+
 void ym_data_write(ym2612_context * context, uint8_t value)
 {
+	context->write_cycle = context->current_cycle;
+	context->busy_start = context->current_cycle + context->clock_inc;
+	
 	if (context->selected_reg >= YM_REG_END) {
 		return;
 	}
@@ -775,13 +813,21 @@ void ym_data_write(ym2612_context * context, uint8_t value)
 		if (context->selected_reg < YM_PART2_START) {
 			return;
 		}
+		if (context->vgm) {
+			vgm_ym2612_part2_write(context->vgm, context->current_cycle, context->selected_reg, value);
+		}
 		context->part2_regs[context->selected_reg - YM_PART2_START] = value;
 	} else {
 		if (context->selected_reg < YM_PART1_START) {
 			return;
 		}
+		if (context->vgm) {
+			vgm_ym2612_part1_write(context->vgm, context->current_cycle, context->selected_reg, value);
+		}
 		context->part1_regs[context->selected_reg - YM_PART1_START] = value;
 	}
+	uint8_t buffer[3] = {context->selected_part, context->selected_reg, value};
+	event_log(EVENT_YM_REG, context->current_cycle, sizeof(buffer), buffer);
 	dfprintf(debug_file, "write of %X to reg %X in part %d\n", value, context->selected_reg, context->selected_part+1);
 	if (context->selected_reg < 0x30) {
 		//Shared regs
@@ -1108,15 +1154,27 @@ void ym_data_write(ym2612_context * context, uint8_t value)
 			}
 		}
 	}
-
-	context->write_cycle = context->current_cycle;
-	context->busy_cycles = context->selected_reg < 0xA0 ? BUSY_CYCLES_DATA_LOW : BUSY_CYCLES_DATA_HIGH;
-	context->status |= 0x80;
 }
 
-uint8_t ym_read_status(ym2612_context * context)
+uint8_t ym_read_status(ym2612_context * context, uint32_t cycle, uint32_t port)
 {
-	return context->status;
+	uint8_t status;
+	port &= context->status_address_mask;
+	if (port) {
+		if (context->last_status_cycle != CYCLE_NEVER && cycle - context->last_status_cycle > context->invalid_status_decay) {
+			context->last_status = 0;
+		}
+		status = context->last_status;
+	} else {
+		status = context->status;
+		if (cycle >= context->busy_start && cycle < context->busy_start + context->busy_cycles) {
+			status |= 0x80;
+		}
+		context->last_status = status;
+		context->last_status_cycle = cycle;
+	}
+	return status;
+		
 }
 
 void ym_print_channel_info(ym2612_context *context, int channel)
@@ -1228,7 +1286,10 @@ void ym_serialize(ym2612_context *context, serialize_buffer *buf)
 	save_int8(buf, context->selected_part);
 	save_int32(buf, context->current_cycle);
 	save_int32(buf, context->write_cycle);
-	save_int32(buf, context->busy_cycles);
+	save_int32(buf, context->busy_start);
+	save_int32(buf, context->last_status_cycle);
+	save_int32(buf, context->invalid_status_decay);
+	save_int8(buf, context->last_status);
 }
 
 void ym_deserialize(deserialize_buffer *buf, void *vcontext)
@@ -1303,5 +1364,13 @@ void ym_deserialize(deserialize_buffer *buf, void *vcontext)
 	context->selected_part = load_int8(buf);
 	context->current_cycle = load_int32(buf);
 	context->write_cycle = load_int32(buf);
-	context->busy_cycles = load_int32(buf);
+	context->busy_start = load_int32(buf);
+	if (buf->size > buf->cur_pos) {
+		context->last_status_cycle = load_int32(buf);
+		context->invalid_status_decay = load_int32(buf);
+		context->last_status = load_int8(buf);
+	} else {
+		context->last_status = context->status;
+		context->last_status_cycle = context->write_cycle;
+	}
 }
